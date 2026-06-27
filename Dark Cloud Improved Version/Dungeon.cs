@@ -837,7 +837,9 @@ namespace Dark_Cloud_Improved_Version
             else Console.WriteLine(ReusableFunctions.GetDateTimeForLog() + "Not enough normal enemies in floor!");
 
             chronicle2 = CustomEffects.CheckChronicle2(chronicle2);
-            CustomChests.ChestRandomizer(currentDungeon, currentFloor, chronicle2); //Randomize the chest loot
+            CustomChests.BasicChestRandomizer(currentDungeon, currentFloor, chronicle2); //Randomize the chest loot (old table-based version)
+            WeaponSpawner.StartReachExtender(); //TEMP: extend Heaven's Cloud reach x3 (dcol* frame scaling)
+            WeaponSpawner.OnFloorEntered();     //TEMP: re-arm the extender for this floor's reloaded model
 
             CheckSidequests();
 
