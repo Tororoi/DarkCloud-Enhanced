@@ -158,7 +158,7 @@ namespace Dark_Cloud_Improved_Version
                     // Enemies.PollEnemyDynamics();
                     // Enemies.MonitorFlashTimer();
                     // Enemies.TeleportEnemiesDebug();        // DEBUG: remove when done
-                    Enemies.DumpModelTableForRenderPosition(); // DEBUG: remove when done
+                    // Enemies.DumpModelTableForRenderPosition(); // DEBUG: remove when done
                     if (!Player.CheckDunIsPaused() && Player.CheckDunIsWalkingMode())
                     {
                         switch (Player.CurrentCharacterNum())
@@ -837,7 +837,9 @@ namespace Dark_Cloud_Improved_Version
             else Console.WriteLine(ReusableFunctions.GetDateTimeForLog() + "Not enough normal enemies in floor!");
 
             chronicle2 = CustomEffects.CheckChronicle2(chronicle2);
-            CustomChests.ChestRandomizer(currentDungeon, currentFloor, chronicle2); //Randomize the chest loot
+            CustomChests.BasicChestRandomizer(currentDungeon, currentFloor, chronicle2); //Randomize the chest loot (old table-based version)
+            Weapons.StartHeavensCloudReach(); // extend Heaven's Cloud reach (dcol1 frame + swing radii)
+            Weapons.OnReachFloorEntered();    // re-locate the freshly reloaded model on this floor
 
             CheckSidequests();
 

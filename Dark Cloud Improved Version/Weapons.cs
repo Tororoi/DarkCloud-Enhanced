@@ -3881,5 +3881,327 @@ namespace Dark_Cloud_Improved_Version
             }
         }
 
+        // ════════════════════════════════════════════════════════════════════════════════════════
+        //  Heaven's Cloud reach + per-weapon whirlwind visual scale (runtime, data-side; no EE-code patch).
+        //  Three features — see docs/weapon-reach.md / WeaponAddresses.WeaponCollision:
+        //   1. Scale Heaven's Cloud's blade mesh "w14" — grows the visible blade AND its dcol hit collision.
+        //   2. Scale the whirlwind effect model (c01_fuusya) for EVERY Toan weapon, sized to its reach.
+        //   3. Distance-gated enemy-hitbox inflation so the scaled HC's close/far hits stay consistent.
+        // ════════════════════════════════════════════════════════════════════════════════════════
+        const int HeavensCloudReachId = 271;
+
+        // Whirl visual scale = D / WhirlwindVisualRadius, where D = the weapon's dcol1 reach (dcol1 Z × mesh
+        // scale) and WhirlwindVisualRadius is the fuusya disc's default radius (its cyl1__cappz X/Z scale). It's
+        // the single eyeball-calibration knob — the base cylinder's unit radius isn't readable from the
+        // VIF1-packed verts, so nudge it until the visual edge meets the hit.
+        const float WhirlwindVisualRadius = 8.0f; // Default 7.467f
+        static float WhirlVisualScale;                          // 0 until located
+        static float _weaponDcol1Z;                             // equipped weapon's dcol1 Z (0 = unknown)
+        static int   _whirlWeaponId = -1;                       // weapon id WhirlVisualScale was computed for
+        static int   _whirlDcolBackoff;
+        static int   _whirlLocateBackoff;
+        static long[] _whirlRoots = System.Array.Empty<long>(); // MMU bases of the fuusya "kiru" roots we scale
+        static readonly float[] _whirlBind3x3 = new float[9];   // root's bind local-matrix 3x3 (target = bind × scale)
+        static bool _whirlBindRead;
+
+        static bool _reachStarted;
+
+        /// <summary>Starts the Heaven's Cloud reach extender background thread (idempotent).</summary>
+        public static void StartHeavensCloudReach()
+        {
+            if (_reachStarted) return;
+            _reachStarted = true;
+            new Thread(ReachLoop) { IsBackground = true }.Start();
+        }
+
+        // ── HC reach scheme (runtime, data-side; see docs/weapon-reach.md top section) ──
+        // L = HcVisualScale * stockDcol1Z (the scaled blade length / tip reach). Two data writes:
+        //   1. Scale the blade mesh "w14" by HcVisualScale → the visible blade AND its dcol hit point grow.
+        //   2. Distance-gated ENEMY body-radius bonus: enemies within L of the player get their body radius
+        //      inflated so close swings connect; enemies beyond L keep stock so far hits stop ~at the blade tip.
+        // We grow the ENEMY body radius (the other half of `dist <= enemyRadius + weaponColRadius`), not the
+        // weapon swing radius, because that half is shared by combo AND charge — one knob covers both.
+        // Persistent while HC is equipped; restored on unequip.
+        const float HcVisualScale = 2.0f;          // w14 mesh scale (test knob)
+        const float HcStockDcol1Z = 9.2053f;       // HC commenu dcol1 Z
+        static long _hcW14Addr;                    // cached "w14" mesh frame MMU addr (0 = not located)
+        static float _hcHitboxDelta;               // persistent delta added to enemy body radii (0 = none)
+        static readonly float[,] _hcHitboxOrig = new float[16, BodyCollision.MaxBodyParts];
+
+        static void MaintainHcReachScheme()
+        {
+            // 1. Scale the visible mesh (grows blade + its dcol collision children together). The hit point
+            //    (dcol1) stays at the blade TIP → its world reach = L = HcVisualScale * stockZ.
+            if (!ScaleWeaponMesh(WeaponCollision.HcMeshNameWord, HcVisualScale)) return;   // mesh not located yet → try next tick
+
+            // 2. Distance-gated enemy hitbox: enemies within L of the player get a reach bonus added to their
+            //    body radius so close swings connect; enemies beyond L keep stock so far hits stop ~at the tip.
+            //    Works for combo AND charge (shared hit-test half). Restored on unequip.
+            float reach = HcVisualScale * HcStockDcol1Z;   // L
+            MaintainEnemyHitbox(reach);
+        }
+
+        // Scale the equipped weapon's visible mesh frame (name@0 == nameWord) by factor: write factor to its
+        // CFrameVu1 local-3x3 diagonal (+0xB8/+0xCC/+0xE0; bind is identity). The engine does not re-pose this
+        // template node, so this holds. Returns false until the frame is located. Caches/re-validates by name.
+        static bool ScaleWeaponMesh(uint nameWord, float factor)
+        {
+            if (_hcW14Addr == 0 || (uint)Memory.ReadInt(_hcW14Addr) != nameWord)
+                _hcW14Addr = LocateModelFrame(nameWord, null);
+            if (_hcW14Addr == 0) return false;
+            long m00 = _hcW14Addr + WeaponCollision.Vu1LocalMatrixDiag0;
+            if (Math.Abs(Memory.ReadFloat(m00) - factor) > 0.01f)
+            {
+                Memory.WriteFloat(m00, factor);
+                Memory.WriteFloat(_hcW14Addr + WeaponCollision.Vu1LocalMatrixDiag1, factor);
+                Memory.WriteFloat(_hcW14Addr + WeaponCollision.Vu1LocalMatrixDiag2, factor);
+            }
+            return true;
+        }
+
+        // Distance-gated enemy hitbox: for each active enemy, if its horizontal distance to the player is within
+        // the range gate, ADD a reach bonus to its body radii so close swings connect; otherwise restore them to
+        // their cached stock value so far hits never land past the blade. The whirlwind charge gets a bigger
+        // bonus + a slightly wider gate (see below). The enemy slot carries both its own world position
+        // (LocationX/Y) and the player's (TargetX/Y mirrors player dunPosition each frame), so the distance is
+        // read entirely from the slot. Caches each part's stock value; forgets it when the slot goes inactive
+        // (next occupant is recaptured from its own stock).
+        static void MaintainEnemyHitbox(float reach)
+        {
+            // The whirlwind charge sweeps a wide arc, so it gets the full `reach` bonus and a slightly wider
+            // range gate; every other attack (combo, lunge) gets reach − 5.0 with the plain gate.
+            bool whirl = Memory.ReadInt(WeaponCollision.ChargeActionState) == 0x18;
+            float bonus  = whirl ? reach : reach;       // added to each enemy's stock body radius
+            float gateSq = whirl ? reach * reach + 5.0f : reach * reach + 2.8f; // squared distance to player for the bonus to apply
+            for (int s = 0; s < 16; s++)
+            {
+                long slot = EnemyAddresses.FloorSlots.SlotAddr(s, 0);
+                int status = Memory.ReadInt(slot + EnemySlotOffsets.RenderStatus);
+                if (status <= 0)                                       // empty slot → forget cached stock
+                {
+                    for (int p = 0; p < BodyCollision.MaxBodyParts; p++) _hcHitboxOrig[s, p] = 0f;
+                    continue;
+                }
+                float dx = Memory.ReadFloat(slot + EnemySlotOffsets.LocationX) - Memory.ReadFloat(slot + EnemySlotOffsets.TargetX);
+                float dy = Memory.ReadFloat(slot + EnemySlotOffsets.LocationY) - Memory.ReadFloat(slot + EnemySlotOffsets.TargetY);
+                bool inRange = dx * dx + dy * dy <= gateSq;
+                for (int p = 0; p < BodyCollision.MaxBodyParts; p++)
+                {
+                    long addr = BodyCollision.RadiusAddr(s, p);
+                    float r = Memory.ReadFloat(addr);
+                    float orig = _hcHitboxOrig[s, p];
+                    if (orig <= 0.01f)                                 // capture stock the first time we see it
+                    {
+                        if (r <= 0.01f || r >= 1000f) continue;       // no real hitbox on this part
+                        orig = _hcHitboxOrig[s, p] = r;
+                    }
+                    float want = inRange ? orig + bonus : orig;        // inflate while close, else stock
+                    if (Math.Abs(r - want) > 0.05f) Memory.WriteFloat(addr, want);
+                }
+            }
+            _hcHitboxDelta = reach;
+        }
+
+        // Restore every inflated enemy body radius to its cached stock base (called when HC is not equipped).
+        // The mesh scale is a per-loaded-model template (reloaded per weapon), so it needs no restore.
+        static void RestoreHcHitbox()
+        {
+            if (_hcHitboxDelta != 0f)
+            {
+                for (int s = 0; s < 16; s++)
+                    for (int p = 0; p < BodyCollision.MaxBodyParts; p++)
+                        if (_hcHitboxOrig[s, p] > 0.01f)
+                        {
+                            Memory.WriteFloat(BodyCollision.RadiusAddr(s, p), _hcHitboxOrig[s, p]);
+                            _hcHitboxOrig[s, p] = 0f;
+                        }
+                _hcHitboxDelta = 0f;
+            }
+            _hcW14Addr = 0;
+        }
+
+        // Walk the equipped weapon model's CFrame tree (POINTER, no scan) for a frame whose name (word@+0x118)
+        // == nameWord and, if fifthByte is given, whose 5th name byte matches (to disambiguate dcol0..dcol3).
+        // The model root = *(*NowWeapon+0xBC) is a CFrame (name@+0x118, child@+0x138, next@+0x13c — confirmed
+        // via CopyFrameVu1/SearchFrame); DFS from it exactly as the game's SearchFrame does. Returns the frame's
+        // NAME address (base+0x118, so the +0xB8/0xE8/0xF0 offset conventions hold), or 0 if not resolvable.
+        static long LocateModelFrame(uint nameWord, byte? fifthByte)
+        {
+            int nw = Memory.ReadInt(WeaponCollision.NowWeaponPtr);
+            if (!IsRamPtr(nw)) return 0;
+            int modelRoot = Memory.ReadInt(Memory.ToMmu(nw) + WeaponCollision.WeaponModelRootOffset);
+            if (!IsRamPtr(modelRoot)) return 0;
+            return FindFrame(Memory.ToMmu(modelRoot), nameWord, fifthByte, 0);
+        }
+
+        // Recursive DFS over the CFrame tree (child @+0x138, sibling @+0x13c, name @+0x118). Returns the matching
+        // frame's NAME address, or 0. Depth-capped so a stray/looping pointer can't recurse forever.
+        static long FindFrame(long node, uint nameWord, byte? fifthByte, int depth)
+        {
+            if (depth > 32) return 0;
+            long name = node + WeaponCollision.CFrameName;
+            if ((uint)Memory.ReadInt(name) == nameWord &&
+                (!fifthByte.HasValue || (byte)Memory.ReadByte(name + 4) == fifthByte.Value))
+                return name;
+            for (int c = Memory.ReadInt(node + WeaponCollision.CFrameChild); IsRamPtr(c); )
+            {
+                long cm = Memory.ToMmu(c);
+                long hit = FindFrame(cm, nameWord, fifthByte, depth + 1);
+                if (hit != 0) return hit;
+                c = Memory.ReadInt(cm + WeaponCollision.CFrameNext);
+            }
+            return 0;
+        }
+
+        /// <summary>Re-arm on floor entry so the freshly reloaded weapon model / fuusya pool is re-located.</summary>
+        public static void OnReachFloorEntered()
+        {
+            _whirlRoots = System.Array.Empty<long>(); _whirlLocateBackoff = 0; _hcW14Addr = 0;
+        }
+
+        static void ReachLoop()
+        {
+            while (true)
+            {
+                try { ReachTick(); }
+                catch (Exception ex) { Console.WriteLine(ReusableFunctions.GetDateTimeForLog() + "HC reach error: " + ex.Message); }
+                Thread.Sleep(150);
+            }
+        }
+
+        static void ReachTick()
+        {
+            bool toan = Player.CurrentCharacterNum() == Player.ToanId;
+            bool hc   = toan && GetEquippedWeaponId() == HeavensCloudReachId;
+
+            // Whirlwind VISUAL scale applies to ALL of Toan's weapons (the fuusya effect is character-, not
+            // weapon-bound), sized to each weapon's own dcol1 reach. Recompute on weapon swap.
+            if (toan)
+            {
+                int wid = GetEquippedWeaponId();
+                if (wid != _whirlWeaponId)
+                {
+                    _whirlWeaponId = wid; _weaponDcol1Z = 0f; WhirlVisualScale = 0f; _whirlDcolBackoff = 0;
+                    // The fuusya pool relocates when a new weapon model loads — drop the cached root(s) and clear
+                    // the locate backoff so the first walking tick re-finds and re-scales it with the NEW scale,
+                    // instead of waiting out a backoff (which let the first post-swap cast render at the old scale).
+                    _whirlRoots = System.Array.Empty<long>(); _whirlLocateBackoff = 0;
+                    // Static table first (offline-extracted dcol1; abs guards mirrored models). Falls back to
+                    // a live tree-walk only for ids not in the table or with no dcol1 frame (e.g. id 277).
+                    if (WeaponDb.TryGetValue(wid, out WeaponData wd) && wd.Dcol1.HasValue)
+                    {
+                        _weaponDcol1Z = Math.Abs(wd.Dcol1.Value);
+                        // D = dcol1 reach × mesh scale (HC's blade is scaled, so its reach — and whirl — grow with it).
+                        float meshScale = (wid == HeavensCloudReachId) ? HcVisualScale : 1.0f;
+                        WhirlVisualScale = (_weaponDcol1Z * meshScale) / WhirlwindVisualRadius;
+                    }
+                }
+                if (_weaponDcol1Z == 0f) { if (_whirlDcolBackoff <= 0) LocateWeaponDcol1(); else _whirlDcolBackoff--; }
+                if (WhirlVisualScale > 0f) MaintainWhirlScale();
+            }
+
+            if (!hc) { RestoreHcHitbox(); return; }   // unequipped → restore inflated enemy hitboxes
+            if (Memory.ReadInt(WeaponCollision.EquippedModelPtr) == 0) return; // model not loaded
+
+            MaintainHcReachScheme();   // scale HC blade + distance-gated enemy-hitbox inflation
+        }
+
+        // Locate / maintain the whirlwind effect (c01_fuusya). Only the root "kiru" matrix transforms the
+        // VERTEX_ANIME mesh, so we scale the root's local-matrix 3x3. The effect is a pool of concurrent
+        // instances (LocateWhirlRoots derefs all of them via pointer); we keep every pool root scaled so
+        // whichever a cast activates is already correct. Each cast re-poses its root once; the maintain re-applies.
+        static void MaintainWhirlScale()
+        {
+            // Only touch the effect during active in-field gameplay. In the weapon menu / floor transitions
+            // the game reallocates models, and writing the fuusya structure then can corrupt the reload and
+            // crash the emulator (observed on weapon switch). Resume when walking again.
+            if (!Player.CheckDunIsWalkingMode()) return;
+
+            if (_whirlRoots.Length > 0)
+            {
+                // Drop the cache if the first root's name vanished (model freed/relocated); else re-apply.
+                if (Memory.ReadUInt(_whirlRoots[0] + WeaponCollision.CFrameName) != WeaponCollision.KiruNameWord)
+                    { _whirlRoots = System.Array.Empty<long>(); return; }
+                // Keep EVERY pool instance scaled (don't narrow to one): a cast right after a swap can activate a
+                // different instance than the previously-live one, so narrowing would leave that first cast at the
+                // wrong scale. Re-applying to all idle copies is harmless (they're at world 0,0,0 until used).
+                float target0 = _whirlBind3x3[0] * WhirlVisualScale;
+                foreach (long root in _whirlRoots)
+                    if (Math.Abs(Memory.ReadFloat(root + WeaponCollision.CFrameLocal3x3[0]) - target0) > 0.01f) WriteWhirlScaled(root);
+            }
+            else if (_whirlLocateBackoff <= 0) LocateWhirlRoots();
+            else _whirlLocateBackoff--;
+        }
+
+        // Scale a fuusya root's local-matrix 3x3 (base+0x1d0) by bind*WhirlVisualScale (the only matrix that
+        // transforms the morph mesh), leaving the translation row (+0x200) anchored. Force a recompute.
+        static void WriteWhirlScaled(long root)
+        {
+            for (int i = 0; i < 9; i++)
+                Memory.WriteFloat(root + WeaponCollision.CFrameLocal3x3[i], _whirlBind3x3[i] * WhirlVisualScale);
+            Memory.WriteInt(root + WeaponCollision.CFrameDirtyWorld, 0);
+        }
+
+        // True if `root` is a fuusya "kiru" instance (next frame +0x270 is "fkiri"). Caches its bind 3x3 once.
+        static bool ValidateWhirlRoot(long root)
+        {
+            if (Memory.ReadUInt(root + WeaponCollision.CFrameName) != WeaponCollision.KiruNameWord) return false;
+            if (Memory.ReadUInt(root + WeaponCollision.FuusyaFrameStride + WeaponCollision.CFrameName) != WeaponCollision.FkiriNameWord) return false;
+            if (!_whirlBindRead)
+            {
+                for (int k = 0; k < 9; k++) _whirlBind3x3[k] = Memory.ReadFloat(root + WeaponCollision.CFrameLocal3x3[k]);
+                if (Math.Abs(_whirlBind3x3[0]) < 0.05f || Math.Abs(_whirlBind3x3[0]) > 4.0f) return false; // already scaled / bad read
+                _whirlBindRead = true;
+            }
+            return true;
+        }
+
+        // Equipped weapon id from the inventory equip slot (updates IMMEDIATELY on a weapon swap, unlike the
+        // battle-block id GetCurrentWeaponId/0x21EA7590 which only refreshes once Toan is walking again — so
+        // keying the reach scheme off this removes the post-swap lag). Toan's weapon list, so callers gate on
+        // ToanId. Returns -1 when no valid slot.
+        static int GetEquippedWeaponId()
+        {
+            int slot = Memory.ReadByte(WeaponCollision.InventoryEquipSlotAddr);
+            if ((uint)slot > 9) return -1;
+            return Memory.ReadUShort(WeaponCollision.InventoryWeaponSlot0Id + slot * WeaponCollision.InventoryWeaponSlotStride);
+        }
+
+        // Fallback for weapons not in WeaponDb (or with no static dcol1): read the EQUIPPED weapon's dcol1 Z
+        // live by tree-walking its model to the "dcol1" frame (LocateModelFrame — POINTER, no scan), and size
+        // the whirl from it. The dcol1 frame's local translation is (0,0,Z) at name+0xE8/+0xEC/+0xF0; Z = reach.
+        static void LocateWeaponDcol1()
+        {
+            long name = LocateModelFrame(WeaponCollision.DcolNameWord, WeaponCollision.Dcol1Digit);
+            if (name == 0) { _whirlDcolBackoff = 8; return; }        // model / dcol1 not ready yet
+            float x = Memory.ReadFloat(name + WeaponCollision.DcolNameToLocalX);
+            float y = Memory.ReadFloat(name + WeaponCollision.DcolNameToLocalX + 4);
+            float z = Memory.ReadFloat(name + WeaponCollision.DcolNameToLocalZ);
+            if (Math.Abs(x) > 0.5f || Math.Abs(y) > 0.5f || z < 0.1f || z > 40f) { _whirlDcolBackoff = 8; return; } // sane (0,0,Z)
+            _weaponDcol1Z = z;
+            WhirlVisualScale = z / WhirlwindVisualRadius;
+        }
+
+        static bool IsRamPtr(int p) => (uint)p >= 0x80000 && (uint)p < 0x2000000;
+
+        // Locate the fuusya effect root(s) via a direct pointer (no RAM scan): the main-character effect object
+        // is a fixed global (MainCharaEffectBase) with EffectSlotCount pool slots; each slot's model object
+        // holds its root CFrame ("kiru") pointer at a fixed offset, so we deref straight to the roots and scale
+        // every valid one. Backs off ~1s if the effect isn't loaded yet. Caches the bind 3x3.
+        static void LocateWhirlRoots()
+        {
+            var roots = new System.Collections.Generic.List<long>();
+            for (int s = 0; s < WeaponCollision.EffectSlotCount; s++)
+            {
+                int p = Memory.ReadInt(WeaponCollision.MainCharaEffectBase + (long)s * WeaponCollision.EffectSlotStride + WeaponCollision.EffectSlotModelOff);
+                if (!IsRamPtr(p)) continue;
+                long root = Memory.ToMmu(p);
+                if (ValidateWhirlRoot(root)) roots.Add(root);
+            }
+            if (roots.Count == 0) { _whirlLocateBackoff = 8; return; }   // effect not loaded yet → retry later
+            _whirlRoots = roots.ToArray();
+            foreach (long root in _whirlRoots) WriteWhirlScaled(root);
+        }
+
     }
 }
