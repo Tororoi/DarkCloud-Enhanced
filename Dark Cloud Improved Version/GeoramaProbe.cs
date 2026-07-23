@@ -35,6 +35,48 @@ namespace Dark_Cloud_Improved_Version
         /// The overhead camera lives in <see cref="TownEditMode"/>.</summary>
         internal static bool Enabled = true;
 
+        // ── ALLOCATOR-CHAIN WATCH ───────────────────────────────────────────────────────────────────
+        //
+        // The town bump allocators are CHAINED: BaseBuffer (ptr @0x2A2A48 -> the town's base CDataAlloc2)
+        // feeds EdVillagerBuffer @0x1D1B360 (= the "fishing pool": _CLEAR_VILLAGER_BUFF / EdInitEventParam
+        // set vb.ptr = base.ptr + base.used*0x10), which feeds EdEventBuffer @0x1D1B370 (_CLEAR_EVENT_BUFF:
+        // eb.ptr = vb.ptr + vb.used*0x10). Struct: {+0 ptr, +8 usedBlocks, +C capBlocks}, block = 0x10.
+        //
+        // This watch answers WHO moves WHAT and WHEN during normal town play — the question behind the
+        // Brownboo cmd-38 mystery (38 recomputes vb from base; if base.used moves after town load, a
+        // session-start 38 lands the pool somewhere new — evidence: town-entry cap 15145 KB vs
+        // fishing-time cap 14369 KB, so base.used demonstrably grows in Brownboo). Log-only, on-change.
+        internal static bool WatchAlloc = false;   // set true to log the town bump-allocator chain per change
+
+        private static readonly long[] _allocPrev = new long[9];
+        private static bool _allocHave;
+
+        private static void WatchAllocators()
+        {
+            if (!WatchAlloc) return;
+
+            uint basePtr = Memory.ReadUInt(0x202A2A48) & Memory.PhysAddrMask;
+            long b0 = 0, b1 = 0, b2 = 0;
+            if (Memory.IsValidGuest(basePtr))
+            {
+                long bs = Memory.ToMmu(basePtr);
+                b0 = Memory.ReadUInt(bs); b1 = Memory.ReadInt(bs + 8); b2 = Memory.ReadInt(bs + 0xC);
+            }
+            long v0 = Memory.ReadUInt(0x21D1B360), v1 = Memory.ReadInt(0x21D1B368), v2 = Memory.ReadInt(0x21D1B36C);
+            long e0 = Memory.ReadUInt(0x21D1B370), e1 = Memory.ReadInt(0x21D1B378), e2 = Memory.ReadInt(0x21D1B37C);
+
+            long[] cur = { b0, b1, b2, v0, v1, v2, e0, e1, e2 };
+            bool changed = !_allocHave;
+            for (int i = 0; i < 9 && !changed; i++) changed = cur[i] != _allocPrev[i];
+            if (!changed) return;
+
+            string F(long ptr, long used, long cap) =>
+                $"0x{ptr:X8} used {used * 16 / 1024,6} KB cap {cap * 16 / 1024,6} KB";
+            Log($"[Alloc] base(@0x{basePtr:X8}) {F(b0, b1, b2)} | vb {F(v0, v1, v2)} | eb {F(e0, e1, e2)}");
+            Array.Copy(cur, _allocPrev, 9);
+            _allocHave = true;
+        }
+
         /// <summary>Log the player's position as they move, and accumulate a bounding box.</summary>
         internal static bool WatchPosition = true;
 
@@ -103,6 +145,8 @@ namespace Dark_Cloud_Improved_Version
         internal static void Tick()
         {
             if (!Enabled) return;
+
+            WatchAllocators();
 
             int map = Memory.ReadInt(EditLoop.MapNo);
 
@@ -230,6 +274,20 @@ namespace Dark_Cloud_Improved_Version
                 $"cpoly=0x{Memory.ReadUInt(FishingSpot.CPoly):X8}  " +
                 $"fishingActive={Memory.ReadInt(FishingAddresses.Active)}");
 
+            // The fishing-TIME pool budget — the number that actually matters for the model load, which the
+            // town-entry dump cannot see. This runs after _CLEAR_VILLAGER_BUFF and _LOAD_FISHING_DATA, so
+            // `used` here is fishing.pak + fish, and `capacity` is what BaseBuffer had free once the event was
+            // running. If this capacity is far below the town-entry 15145 KB, the fishing event is eating
+            // BaseBuffer and that — not the town's static data — is why the 1.77 MB model overflows.
+            long poolUsed = (long)Memory.ReadInt(FishingPool.Used) * FishingPool.BlockSize;
+            long poolCap  = (long)Memory.ReadInt(FishingPool.Capacity) * FishingPool.BlockSize;
+            Log($"    POOL @fishing-time: capacity={poolCap / 1024f:0.#} KB  used={poolUsed / 1024f:0.#} KB  " +
+                $"free={(poolCap - poolUsed) / 1024f:0.#} KB  (model needs {FishingPool.TuriModelBytes / 1024f:0.#} KB)");
+
+            DumpCPoly();
+            DumpCPolyFile();
+            DumpGroundGrid();
+
             // WHAT fired it? If an event point did, EdGetEvent will have left the match here. If both read
             // as nothing, the trigger is not an event point and we look elsewhere — but either way this is a
             // fact rather than another inference.
@@ -253,13 +311,251 @@ namespace Dark_Cloud_Improved_Version
 
         private static void SamplePosition()
         {
+            // In the overhead (bird's-eye) camera the PLAYER stands still while the CAMERA pans over the map.
+            // A CCamera's look-at point is at +0x270, and that is the ground point you are flying over — the
+            // thing we want for mapping. But it is not obvious WHICH camera object is active in this mode, so
+            // log the look-at of both candidates until we see which one tracks your input; then I lock onto
+            // it. In walking/fishing mode, just read the player.
+            if (Memory.ReadInt(EditLoop.GameMode) == EditLoop.GameModeOverhead)
+            {
+                SampleOverhead();
+                return;
+            }
+
             if (!ReadPos(out float x, out float y, out float z)) return;
             Accumulate(x, y, z);
 
             if (!float.IsNaN(_lx) && Math.Abs(x - _lx) <= MoveEpsilon && Math.Abs(z - _lz) <= MoveEpsilon)
                 return;
             _lx = x; _lz = z;
-            Log($"pos  x={x:0.##}  y={y:0.##} (height)  z={z:0.##}");
+
+            // Yaw too: Norune's fishing script SNAPS the player to a fixed spot and faces them at the water
+            // (_SET_NPC_POS / _SET_NPC_ROT) before entering fishing mode. To do the same in a new town we need
+            // the stance — stand at the water's edge looking at it, and these are the numbers to bake in.
+            Log($"pos   x={x:0.##}  y={y:0.##} (height)  z={z:0.##}   yaw={ReadYaw():0.###} rad");
+        }
+
+        /// <summary>
+        /// Dump the fishing collision geometry, to settle whether a spot has a real basin for the fish/hook.
+        ///
+        /// A CCPoly is 0x50 bytes: three triangle verts at +0x00/+0x10/+0x20 (x,y,z floats) and a normal at
+        /// +0x30. The hook sinks until it hits one of these (HookGroundLevel), so a proper pond has a FLOOR
+        /// (near-horizontal polys clustered at the bed) plus WALLS (near-vertical polys at the edges). A town
+        /// never meant for fishing may have neither, letting the hook and fish fall straight through.
+        ///
+        /// Compare this line between a real spot (Muska Lacka oasis, Matataki pond) and ours.
+        /// </summary>
+        private static void DumpCPoly()
+        {
+            int count = Memory.ReadInt(FishingSpot.CPolyNum);
+            uint p = Memory.ReadUInt(FishingSpot.CPoly) & Memory.PhysAddrMask;
+            if (count <= 0 || count > 1024 || !Memory.IsValidGuest(p))
+            {
+                Log($"    CPOLY: count={count} (none to analyse)");
+                return;
+            }
+
+            long baseAddr = Memory.ToMmu(p);
+            float minY = float.MaxValue, maxY = float.MinValue;
+            float minX = float.MaxValue, maxX = float.MinValue, minZ = float.MaxValue, maxZ = float.MinValue;
+            int floorish = 0, wallish = 0;
+
+            // The question for the native-collision shortcut: are there WALLS near the fishing spot, and at
+            // what Y do they reach DOWN to? If crater walls near the spot descend to ~the water, we can raise
+            // the fish into that band and let the town's own collision contain them.
+            float spotX = SpotProbeX, spotZ = SpotProbeZ;
+            float nearWallMinY = float.MaxValue, nearWallMaxY = float.MinValue;
+            int nearWalls = 0;
+
+            for (int i = 0; i < count; i++)
+            {
+                long poly = baseAddr + (long)i * 0x50;
+                float pminY = float.MaxValue, pmaxY = float.MinValue, pcx = 0, pcz = 0;
+                for (int v = 0; v < 3; v++)
+                {
+                    float vx = Memory.ReadFloat(poly + v * 0x10);
+                    float vy = Memory.ReadFloat(poly + v * 0x10 + 4);
+                    float vz = Memory.ReadFloat(poly + v * 0x10 + 8);
+                    if (vy < minY) minY = vy; if (vy > maxY) maxY = vy;
+                    if (vx < minX) minX = vx; if (vx > maxX) maxX = vx;
+                    if (vz < minZ) minZ = vz; if (vz > maxZ) maxZ = vz;
+                    if (vy < pminY) pminY = vy; if (vy > pmaxY) pmaxY = vy;
+                    pcx += vx; pcz += vz;
+                }
+                float ny = Memory.ReadFloat(poly + 0x30 + 4);   // normal Y
+                bool wall = Math.Abs(ny) < 0.3f;
+                if (Math.Abs(ny) > 0.7f) floorish++;
+                else if (wall) wallish++;
+
+                // is this a wall within ~180 units (XZ) of the fishing spot?
+                float dx = pcx / 3f - spotX, dz = pcz / 3f - spotZ;
+                if (wall && dx * dx + dz * dz < 180f * 180f)
+                {
+                    nearWalls++;
+                    if (pminY < nearWallMinY) nearWallMinY = pminY;
+                    if (pmaxY > nearWallMaxY) nearWallMaxY = pmaxY;
+                }
+            }
+
+            Log($"    CPOLY: count={count}  Y {minY:0.#}..{maxY:0.#}  X {minX:0.#}..{maxX:0.#}  Z {minZ:0.#}..{maxZ:0.#}");
+            Log($"    CPOLY: {floorish} floor-ish, {wallish} wall-ish");
+            if (nearWalls > 0)
+                Log($"    CPOLY: {nearWalls} WALLS within 180u of spot ({spotX:0},{spotZ:0}) — they span Y " +
+                    $"{nearWallMinY:0.#}..{nearWallMaxY:0.#}  (if these reach near the water, native walls can contain fish)");
+            else
+                Log($"    CPOLY: NO walls within 180u of spot ({spotX:0},{spotZ:0}) — native collision won't contain fish here");
+        }
+
+        /// <summary>Where the per-poly cpoly dump is written. One line per triangle:
+        /// v0x,v0y,v0z,v1x,v1y,v1z,v2x,v2y,v2z,nx,ny,nz. NOTE: this dumps the LIVE cpoly at spot load, which
+        /// may already be modified by the mod (e.g. the floors-only experiment). It writes to a SEPARATE
+        /// file so it never clobbers the preserved full-vanilla reference the viewer reads
+        /// (tools/vanilla_cpoly.csv). To recapture the full reference, disable the mod's cpoly edits and copy
+        /// this file over it.</summary>
+        // Dev-only diagnostics. They run ONLY when DC_DUMP_DIR is set (a folder to dump into); if it's unset the
+        // dumps are skipped entirely — never a fallback path, never a personal path. (See .env.sample.)
+        private static readonly string DumpDir = Environment.GetEnvironmentVariable("DC_DUMP_DIR");
+        internal static string CPolyDumpPath = DumpDir == null ? null : System.IO.Path.Combine(DumpDir, "vanilla_cpoly_live.csv");
+
+        /// <summary>
+        /// Dump EVERY native cpoly triangle (verts + normal) to a CSV, so the viewer can render the exact
+        /// collision the town already loads. The summary in <see cref="DumpCPoly"/> tells us how many polys
+        /// and their bounds; this tells us WHERE each one is — which is what lets us reclaim/repurpose the
+        /// vanilla polys instead of appending new ones for fishing.
+        /// </summary>
+        private static void DumpCPolyFile()
+        {
+            if (CPolyDumpPath == null) return;   // DC_DUMP_DIR unset — diagnostic disabled
+            int count = Memory.ReadInt(FishingSpot.CPolyNum);
+            uint p = Memory.ReadUInt(FishingSpot.CPoly) & Memory.PhysAddrMask;
+            if (count <= 0 || count > 1024 || !Memory.IsValidGuest(p))
+            {
+                Log($"    CPOLY FILE: not written (count={count})");
+                return;
+            }
+
+            long baseAddr = Memory.ToMmu(p);
+            var sb = new StringBuilder();
+            sb.AppendLine("v0x,v0y,v0z,v1x,v1y,v1z,v2x,v2y,v2z,nx,ny,nz");
+            for (int i = 0; i < count; i++)
+            {
+                long poly = baseAddr + (long)i * 0x50;
+                for (int v = 0; v < 3; v++)
+                {
+                    sb.Append(Memory.ReadFloat(poly + v * 0x10).ToString("0.###")).Append(',');
+                    sb.Append(Memory.ReadFloat(poly + v * 0x10 + 4).ToString("0.###")).Append(',');
+                    sb.Append(Memory.ReadFloat(poly + v * 0x10 + 8).ToString("0.###")).Append(',');
+                }
+                sb.Append(Memory.ReadFloat(poly + 0x30).ToString("0.###")).Append(',');
+                sb.Append(Memory.ReadFloat(poly + 0x30 + 4).ToString("0.###")).Append(',');
+                sb.Append(Memory.ReadFloat(poly + 0x30 + 8).ToString("0.###"));
+                sb.AppendLine();
+            }
+            try
+            {
+                System.IO.File.WriteAllText(CPolyDumpPath, sb.ToString());
+                Log($"    CPOLY FILE: wrote {count} polys -> {CPolyDumpPath}");
+            }
+            catch (Exception e)
+            {
+                Log($"    CPOLY FILE: write FAILED: {e.Message}");
+            }
+        }
+
+        /// <summary>Where the base-ground grid dump is written, for the viewer to reconstruct the accurate
+        /// pond-bottom bowl. One line per cell: area,i,j,worldX,worldZ,height,code.</summary>
+        internal static string GroundGridPath = DumpDir == null ? null : System.IO.Path.Combine(DumpDir, "ground_grid.csv");
+
+        /// <summary>
+        /// Dump the town's base-ground GRID (all 4 CEditArea grids) — the accurate pond-bottom source. Unlike
+        /// cpoly (which skips underwater/non-walkable cells), this walks EVERY cell and records its world XZ,
+        /// its height (OriginY + altRaw*UnitAlt) and its code, so the viewer can rebuild the shallow-shore
+        /// bowl the collision gather leaves out. See EditArea (TownAddresses.cs) for the struct.
+        /// </summary>
+        private static void DumpGroundGrid()
+        {
+            if (GroundGridPath == null) return;   // DC_DUMP_DIR unset — diagnostic disabled
+            long g = EditGround.Base();
+            if (g == 0) { Log("   GROUND GRID: CEditGround null — skipping"); return; }
+
+            // Diagnostic: log the raw area pointers. If all 0/invalid, this town has no runtime CEditArea
+            // grid (expected for fixed, non-georama-editable towns like Brownboo, map 14) — the pond bottom
+            // is built frames, not an editable grid, and must be reconstructed offline from the georama tiles.
+            {
+                uint rawG = Memory.ReadUInt(EditGround.EditGroundPtr);
+                var ap = new int[EditGround.AreaCount];
+                for (int a = 0; a < EditGround.AreaCount; a++)
+                    ap[a] = unchecked((int)Memory.ReadUInt(g + EditGround.AreaPtrBase + a * 4));
+                Log($"   GROUND GRID: CEditGround ptr=0x{rawG:X8}  areaPtrs=[{string.Join(", ", System.Array.ConvertAll(ap, v => $"0x{v:X8}"))}]");
+            }
+
+            var sb = new StringBuilder();
+            sb.AppendLine("area,i,j,worldX,worldZ,height,code");
+            int total = 0, areas = 0;
+            for (int a = 0; a < EditGround.AreaCount; a++)
+            {
+                long area = EditArea.Ptr(g, a);
+                if (area == 0) continue;
+
+                int w = Memory.ReadInt(area + EditArea.Width);
+                int h = Memory.ReadInt(area + EditArea.Height);
+                if (w <= 0 || w > 64 || h <= 0 || h > 16)   // sane bounds (row stride caps Height at 16)
+                { Log($"   GROUND GRID: area {a} bad dims {w}x{h} — skipping"); continue; }
+
+                float ox = Memory.ReadFloat(area + EditArea.OriginX);
+                float oy = Memory.ReadFloat(area + EditArea.OriginY);
+                float oz = Memory.ReadFloat(area + EditArea.OriginZ);
+                float unit = Memory.ReadFloat(area + EditArea.UnitSize);
+                float ualt = Memory.ReadFloat(area + EditArea.UnitAlt);
+                areas++;
+
+                for (int i = 0; i < w; i++)
+                for (int j = 0; j < h; j++)
+                {
+                    long off = (long)i * EditArea.RowStride + (long)j * EditArea.CellStride;
+                    int altRaw = Memory.ReadInt(area + EditArea.AltBase + off);
+                    int code   = Memory.ReadInt(area + EditArea.CodeBase + off);
+                    float wx = ox + i * unit;
+                    float wz = oz + j * unit;
+                    float hgt = oy + altRaw * ualt;
+                    sb.Append(a).Append(',').Append(i).Append(',').Append(j).Append(',')
+                      .Append(wx.ToString("0.##")).Append(',').Append(wz.ToString("0.##")).Append(',')
+                      .Append(hgt.ToString("0.###")).Append(',').Append(code).Append('\n');
+                    total++;
+                }
+            }
+            try
+            {
+                System.IO.File.WriteAllText(GroundGridPath, sb.ToString());
+                Log($"   GROUND GRID: dumped {total} cells across {areas} area(s) -> {GroundGridPath}");
+            }
+            catch (Exception e)
+            {
+                Log($"   GROUND GRID: write FAILED: {e.Message}");
+            }
+        }
+
+        /// <summary>The fishing spot's approximate centre, for the near-spot collision probe (Brownboo).</summary>
+        internal static float SpotProbeX = 74f, SpotProbeZ = -20f;
+
+        private const int CameraRef = 0x270;   // CCamera look-at point (GetRef__7CCamera reads +0x270)
+
+        private static void SampleOverhead() =>
+            LogCameraRef("CURSOR", EditLoop.EditCamera, ref _lEditX, ref _lEditZ);
+
+        private static float _lEditX = float.NaN, _lEditZ;
+
+        /// <summary>Log a camera's look-at point when it moves; returns whether it did.</summary>
+        private static bool LogCameraRef(string tag, long camera, ref float lx, ref float lz)
+        {
+            float x = Memory.ReadFloat(camera + CameraRef);
+            float y = Memory.ReadFloat(camera + CameraRef + 4);
+            float z = Memory.ReadFloat(camera + CameraRef + 8);
+            if (!float.IsNaN(lx) && Math.Abs(x - lx) <= MoveEpsilon && Math.Abs(z - lz) <= MoveEpsilon)
+                return false;
+            lx = x; lz = z;
+            Log($"{tag}  x={x:0.##}  y={y:0.##} (height)  z={z:0.##}");
+            return true;
         }
 
         /// <summary>MapNo is the same id TownCharacter calls `currentArea` (it reads 0x202A2518).</summary>
@@ -295,6 +591,7 @@ namespace Dark_Cloud_Improved_Version
             DumpWaterSurfaces(info);
             DumpPlacedParts();
             DumpFishingState();
+            DumpFishingPool();
             Log("===== END =====");
 
             // The event points and the script are loaded LATER than the texture banks — the first run dumped
@@ -399,6 +696,46 @@ namespace Dark_Cloud_Improved_Version
             }
             Log($"-- placed parts: {used} used, {free} free (of {EditGround.PlacedCount}) --");
             if (sb.Length > 0) Log(sb.ToString().TrimEnd());
+
+            DumpMeshObjects(g);
+        }
+
+        /// <summary>Dump every occupied map object (both the 128-slot placed array and the 64-slot static-cfg
+        /// array) with its world position, Y rotation and resolved model name. Used to recover the georama
+        /// placement of scene-mesh blocks that sit at LOCAL origin in scene.scn (e.g. Brownboo's houses),
+        /// so their collision/visualisation can be placed in world space.</summary>
+        private static void DumpMeshObjects(long g)
+        {
+            long info = EditInfo.Base();
+            foreach (var (label, baseOff, count) in new[]
+                     {
+                         ("PLACED", EditGround.PlacedBase, EditGround.PlacedCount),
+                         ("STATIC", EditGround.ExtraBase, 64),
+                     })
+            {
+                var sb = new StringBuilder();
+                int n = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    long s = g + baseOff + (long)i * MapParts.Stride;
+                    if (Memory.ReadInt(s + MapParts.Occupied) < 0) continue;   // free
+                    if (Memory.ReadUInt(s + MapParts.ModelPtr) == 0) continue; // no mesh
+
+                    int id = Memory.ReadInt(s + MapParts.PartId);
+                    float x = Memory.ReadFloat(s + MapParts.Position);
+                    float y = Memory.ReadFloat(s + MapParts.Position + 4);
+                    float z = Memory.ReadFloat(s + MapParts.Position + 8);
+                    float rx = Memory.ReadFloat(s + 0x60), ry = Memory.ReadFloat(s + 0x64), rz = Memory.ReadFloat(s + 0x68);
+                    string model = (info != 0 && id >= 0 && id < EditInfo.MaxParts)
+                                 ? ReadCStr(info + EditInfo.PartBase + (long)id * EditInfo.PartStride + EditInfo.PartName, 32)
+                                 : "?";
+                    sb.AppendLine($"        [{i,3}] part {id,2} '{model,-14}' pos ({x,7:0.#}, {y,6:0.#}, {z,7:0.#}) " +
+                                  $"rot ({rx:0.##}, {ry:0.##}, {rz:0.##})");
+                    n++;
+                }
+                Log($"-- {label} mesh objects: {n} with a model --");
+                if (sb.Length > 0) Log(sb.ToString().TrimEnd());
+            }
         }
 
         /// <summary>
@@ -442,13 +779,12 @@ namespace Dark_Cloud_Improved_Version
                 float px = Memory.ReadFloat(e + EventPoints.Position);
                 float py = Memory.ReadFloat(e + EventPoints.Position + 4);
                 float pz = Memory.ReadFloat(e + EventPoints.Position + 8);
-                float bx = Memory.ReadFloat(e + EventPoints.BoxSize);
-                float by = Memory.ReadFloat(e + EventPoints.BoxSize + 4);
-                float bz = Memory.ReadFloat(e + EventPoints.BoxSize + 8);
+                float radius = Memory.ReadFloat(e + EventPoints.Radius);
+                int part = Memory.ReadInt(e + EventPoints.PartIndex);
 
                 lines.AppendLine($"        [{i,2}] type={type} itemOrLabel={Memory.ReadInt(e + EventPoints.ItemOrLabel)} " +
-                                 $"name='{name}' pos=({px:0.#}, {py:0.#}, {pz:0.#}) box=({bx:0.#}, {by:0.#}, {bz:0.#}) " +
-                                 $"rotY={Memory.ReadFloat(e + EventPoints.RotY):0.##}");
+                                 $"name='{name}' pos=({px:0.#}, {py:0.#}, {pz:0.#}) radius={radius:0.#} " +
+                                 $"partIndex={part}{(part >= 0 ? " (pos is PART-LOCAL)" : " (pos is world)")}");
                 lines.AppendLine($"             raw {sb.ToString().TrimEnd()}");
             }
             Log($"-- event points: {used} used of {n} (stride 0x{EventPoints.Stride:X}) --");
@@ -483,6 +819,27 @@ namespace Dark_Cloud_Improved_Version
                 if ((i + 1) % 6 == 0) sb.AppendLine().Append("        ");
             }
             Log("        " + sb.ToString().TrimEnd());
+        }
+
+        /// <summary>
+        /// The villager/fishing memory pool. This is where a fishing session must fit the 1.73 MB turi model
+        /// plus fishing.pak — and it is sized to whatever the parent buffer has free, so a heavier town gets a
+        /// smaller pool. Comparing this between a town that fishes (Yellow Drops) and one that crashes
+        /// (Brownboo) is the whole diagnosis: if Brownboo's capacity is below the model size, that is why.
+        /// </summary>
+        private static void DumpFishingPool()
+        {
+            long usedB = (long)Memory.ReadInt(FishingPool.Used) * FishingPool.BlockSize;
+            long capB  = (long)Memory.ReadInt(FishingPool.Capacity) * FishingPool.BlockSize;
+            long freeB = capB - usedB;
+            long need  = FishingPool.TuriModelBytes;
+
+            Log("-- fishing pool (0x1D1B360) --");
+            Log($"   capacity={capB / 1024f:0.#} KB  used={usedB / 1024f:0.#} KB  free={freeB / 1024f:0.#} KB");
+            Log($"   turi model needs {need / 1024f:0.#} KB -> {(capB >= need ? "FITS capacity" : "TOO BIG for capacity")}" +
+                $", {(freeB >= need ? "fits free space now" : "does NOT fit free space now")}");
+            Log("   (this is BEFORE fishing clears villagers; the session frees them first, so the real budget " +
+                "is nearer capacity than free)");
         }
 
         /// <summary>The live fishing globals, if a spot has been loaded this session.</summary>
@@ -576,6 +933,14 @@ namespace Dark_Cloud_Improved_Version
         /// [1407.34, 170, 43.52] with the middle value tracking the EDITAREA base heights — i.e. the
         /// naming does not survive contact with the data. The CFrame is unambiguous, so use it.
         /// </summary>
+        /// <summary>The player's yaw, from the CObject rotation at +0x60 (see EditLoop.CharaRotation).</summary>
+        internal static float ReadYaw()
+        {
+            uint p = Memory.ReadUInt(EditLoop.CharaPtr) & Memory.PhysAddrMask;
+            if (!Memory.IsValidGuest(p)) return 0f;
+            return Memory.ReadFloat(Memory.ToMmu(p) + EditLoop.CharaRotation + 4);
+        }
+
         private static bool ReadPos(out float x, out float y, out float z)
         {
             x = y = z = 0f;

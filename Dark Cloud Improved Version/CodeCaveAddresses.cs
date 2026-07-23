@@ -202,6 +202,41 @@ namespace Dark_Cloud_Improved_Version
         internal const long MeshCave       = 0x21F56400;
         internal const long MeshCaveGuest  = 0x01F56400;
         internal const int  MeshCaveSize   = 0x58000;    // → ends 0x21FAE400, 0x5F00 clear of the band top (0x1FB4300)
+
+        // ── Fishing: catch-message template ────────────────────────────────────────────────────────────
+        // A tiny 1-entry meswin buffer holding the fishing CATCH template (message id 2000), swapped into the
+        // town talk ClsMes (0x21D1B550 +0x17A0) ONLY while a fishing session is open. Custom fishing towns lack
+        // msg 2000 in their own talk mes, so the vanilla catch bubble renders EMPTY; this supplies it, and the
+        // engine's own flow (fish name from the global system14e.bin, numbers from the value array) fills it in.
+        // Sits in the MeshCave safety margin — MeshCave is FIXED-size, so nothing grows into this. ~138 bytes.
+        internal const long FishingCatchMes      = 0x21FB4000;   // ends ~0x21FB4090, below band top 0x21FB4300
+        internal const uint FishingCatchMesGuest = 0x01FB4000;
+
+        // The fishing MENU text (event mes ids 20 "Fish/Exchange FP/Fishing log/Quit", 21 "no pole", 22
+        // "Continue/Quit"), swapped into the EVENT-mes ClsMes (EditEventMes1 0x21D1E4D0 +0x17A0, window 1)
+        // while a session is open. Custom towns' event mes lacks these ids; vanilla fishing towns have them.
+        // 312 bytes; sits just above FishingCatchMes in the same MeshCave margin.
+        internal const long FishingMenuMes       = 0x21FB4100;   // ends 0x21FB4238, below band top 0x21FB4300
+        internal const uint FishingMenuMesGuest  = 0x01FB4100;
+
+        // ── Fishing sign injection ───────────────────────────────────────────────────────────────────
+        // This region (MeshCave margin, below the fishing-mes blocks, clear of 0x21FB4000) hosts the sign
+        // asset buffers + a one-shot load stub + config. It is shared by two mutually-exclusive approaches:
+        //   • GlobalSignLoader (CURRENT): loads the kanban as a GLOBAL CFrame via LoadMDSFile and registers
+        //     e01b24 into the system texture manager 0x1c75870 (the miracle-chest's path) — then a draw hook
+        //     renders it. The two asset buffers below pack exactly into 0x21FAE400..0x21FB3400.
+        //   • SignInjector (SUPERSEDED, not armed): built the sign as a villager from a bundled fishsign.chr.
+        //     Its SignChrCave alias covers the same bytes; only one loader is ever armed, so there is no clash.
+        internal const long SignMdsCave       = 0x21FAE400;   // kanban.mds  (2160 B) → ends 0x21FAEC70
+        internal const uint SignMdsCaveGuest  = 0x01FAE400;
+        internal const long SignImgCave       = 0x21FAEC70;   // e01b24_bank.img (18320 B, IM2) → ends 0x21FB3400
+        internal const uint SignImgCaveGuest  = 0x01FAEC70;
+        internal const long SignChrCave       = 0x21FAE400;   // (superseded) fishsign.chr alias — SignInjector
+        internal const uint SignChrCaveGuest  = 0x01FAE400;
+        internal const long SignStubCave      = 0x21FB3400;   // the cave stub (custom cmd-10 handler)
+        internal const uint SignStubCaveGuest = 0x01FB3400;
+        internal const long SignConfig        = 0x21FB3600;   // GlobalSignLoader: +0 ready +4 loaded +8 cframe +C fires
+        internal const uint SignConfigGuest   = 0x01FB3600;
     }
 
 }
