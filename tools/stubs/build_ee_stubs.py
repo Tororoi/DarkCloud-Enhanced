@@ -37,6 +37,10 @@ STUBS = [
     ('camera_norm_side.s',       'cameraNormSide.bin',       0x1FB0350),
     ('stilts_heal.s',            'stiltsHeal.bin',           0x1FB0BD0),
     ('water_order_gate.s',       'waterOrderGate.bin',       0x1FB0C50),
+    ('cat_pellet_follow.s',      'catPelletFollow.bin',      0x1FB0D90),
+    ('xiao_melee_flinch.s',      'xiaoMeleeFlinch.bin',      0x1FB1FA0),
+    ('cat_glow_draw.s',          'catGlowDraw.bin',          0x1FB2000),
+    ('cat_sphere_percent.s',     'catSpherePercent.bin',     0x1FB21E0),
     ('town_camera_collision.s',  'townCameraCollision.bin',  0x14B838),
     ('camera_height.s',          'cameraHeight.bin',         0x27D090),
 ]
